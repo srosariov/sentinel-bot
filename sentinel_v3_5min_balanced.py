@@ -517,8 +517,11 @@ async def binance_ws_listener() -> None:
     while True:
         try:
             log.info("Connecting to Binance WebSocket …")
-            async with websockets.connect(
+        async with websockets.connect(
                 url,
+                extra_headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+                },
                 ping_interval=20,
                 ping_timeout=30,
             ) as ws:
