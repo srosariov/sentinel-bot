@@ -1,5 +1,0 @@
-py-clob-client
-python-telegram-bot>=20
-python-dotenv
-aiohttp
-websockets
