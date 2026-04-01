@@ -1,1 +1,0 @@
-worker: python sentinel_v3_5min_balanced.py
