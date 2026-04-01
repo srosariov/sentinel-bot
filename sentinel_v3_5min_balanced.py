@@ -168,10 +168,148 @@ async def tg_send(text: str, parse_mode: str = "HTML") -> None:
     except Exception as exc:
         log.warning("Telegram send error: %s", exc)
 
-# (resto de helpers y funciones se mantienen igual – solo cambiamos el WS)
+async def tg_send_document(filepath: str, caption: str = "") -> None:
+    if not STATE.tg_bot or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        with open(filepath, "rb") as fh:
+            await STATE.tg_bot.send_document(chat_id=TELEGRAM_CHAT_ID, document=fh, caption=caption)
+    except Exception as exc:
+        log.warning("Telegram document send error: %s", exc)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BINANCE WEBSOCKET LISTENER (CORREGIDO)
+# CSV PERSISTENCE
+# ══════════════════════════════════════════════════════════════════════════════
+CSV_FIELDNAMES = [
+    "timestamp", "asset", "market_id", "side",
+    "entry_price", "exit_price", "size_usd",
+    "ev_pct", "bayesian_pct", "ob_imbalance",
+    "lag_seconds", "hold_seconds", "profit", "result",
+]
+
+def write_csv(trade: dict) -> None:
+    file_exists = os.path.isfile(CSV_FILE)
+    try:
+        with open(CSV_FILE, "a", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=CSV_FIELDNAMES)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow({k: trade.get(k, "") for k in CSV_FIELDNAMES})
+    except Exception as exc:
+        log.warning("CSV write error: %s", exc)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QUANT ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+def bayesian_posterior(base_prob: float, lag_signal_strength: float, ob_imbalance: float, volume_ratio: float) -> float:
+    prior = max(0.01, min(0.99, base_prob))
+    lr_lag = 1.0 + 2.5 * lag_signal_strength
+    lr_ob = 1.0 + 1.8 * ob_imbalance
+    lr_vol = 1.0 + 0.4 * min(volume_ratio, 2.0)
+    numerator = prior * lr_lag * lr_ob * lr_vol
+    denominator = numerator + (1.0 - prior)
+    posterior = numerator / denominator
+    return float(min(max(posterior, 0.001), 0.999))
+
+def compute_ev(polymarket_prob: float, true_prob: float) -> float:
+    if polymarket_prob <= 0:
+        return 0.0
+    return (true_prob - polymarket_prob) / polymarket_prob
+
+def order_book_imbalance(bids: list, asks: list) -> float:
+    bid_vol = sum(float(b[1]) for b in bids) if bids else 0.0
+    ask_vol = sum(float(a[1]) for a in asks) if asks else 0.0
+    total = bid_vol + ask_vol
+    if total == 0:
+        return 0.0
+    return abs(bid_vol - ask_vol) / total
+
+def kelly_size(ev: float, win_prob: float, bankroll: float) -> float:
+    if ev <= 0 or win_prob <= 0 or win_prob >= 1:
+        return 0.0
+    b = ev / win_prob
+    q = 1.0 - win_prob
+    f_star = max(0.0, (b * win_prob - q) / b)
+    raw = KELLY_FRACTION * f_star * bankroll
+    return float(min(raw, MAX_TRADE_USD))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAG SIGNAL ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+def compute_lag_signal(asset: str, polymarket_prob: float) -> tuple[float, float]:
+    kline = STATE.klines.get(asset, {})
+    if not kline:
+        return 0.0, polymarket_prob
+    o = kline.get("open", 0.0)
+    c = kline.get("close", 0.0)
+    h = kline.get("high", 0.0)
+    l = kline.get("low", 0.0)
+    candle_range = max(h - l, 1e-9)
+    body = c - o
+    body_pct = abs(body) / candle_range
+    direction = 1 if body > 0 else -1
+    if direction == 1 and polymarket_prob < 0.62:
+        lag_strength = body_pct * (0.62 - polymarket_prob) / 0.62
+        true_prob = polymarket_prob + lag_strength * 0.35
+    elif direction == -1 and polymarket_prob > 0.38:
+        lag_strength = body_pct * (polymarket_prob - 0.38) / 0.62
+        true_prob = polymarket_prob - lag_strength * 0.35
+    else:
+        lag_strength = 0.0
+        true_prob = polymarket_prob
+    return float(lag_strength), float(min(max(true_prob, 0.01), 0.99))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POLYMARKET — MARKET DISCOVERY & ORDER BOOK
+# ══════════════════════════════════════════════════════════════════════════════
+async def fetch_polymarket_5min_markets(session: aiohttp.ClientSession) -> None:
+    # (código original sin cambios)
+    asset_keywords = {"BTC": ["bitcoin", "btc"], "ETH": ["ethereum", "eth"], "SOL": ["solana", "sol"]}
+    try:
+        url = f"{GAMMA_BASE}/markets"
+        params = {"active": "true", "closed": "false", "order": "volume24hr", "ascending": "false", "limit": "200"}
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return
+            data = await resp.json()
+        markets_list = data if isinstance(data, list) else data.get("markets", [])
+        now = datetime.now(timezone.utc)
+        for asset, keywords in asset_keywords.items():
+            found = []
+            for m in markets_list:
+                question = (m.get("question") or m.get("title") or "").lower()
+                if not any(kw in question for kw in keywords):
+                    continue
+                end_str = m.get("endDate") or m.get("end_date_iso") or ""
+                if not end_str:
+                    continue
+                try:
+                    end_dt = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+                    seconds_left = (end_dt - now).total_seconds()
+                    if 0 < seconds_left <= 600:
+                        m["_seconds_left"] = seconds_left
+                        m["_asset"] = asset
+                        found.append(m)
+                except ValueError:
+                    continue
+            STATE.markets[asset] = found
+    except Exception as exc:
+        log.warning("Market discovery error: %s", exc)
+
+async def fetch_order_book(session: aiohttp.ClientSession, market_id: str) -> tuple[list, list]:
+    try:
+        url = f"{CLOB_BASE}/book"
+        params = {"token_id": market_id}
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return [], []
+            data = await resp.json()
+        return data.get("bids", []), data.get("asks", [])
+    except Exception:
+        return [], []
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BINANCE WEBSOCKET LISTENER (CORREGIDO CON USER-AGENT)
 # ══════════════════════════════════════════════════════════════════════════════
 async def binance_ws_listener() -> None:
     stream_path = "/".join(BINANCE_STREAMS.values())
@@ -213,7 +351,7 @@ async def binance_ws_listener() -> None:
             log.warning("Binance WebSocket error: %s — reconnecting in 5 s …", exc)
             await asyncio.sleep(5)
 
-# (El resto del código se mantiene exactamente igual – no lo cambio para no romper nada)
+# (El resto del código es idéntico al original – no lo cambio para evitar errores)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
