@@ -1,0 +1,4 @@
+aiohttp>=3.9.0
+python-telegram-bot>=20.7
+python-dotenv>=1.0.0
+py-clob-client>=0.16.0
