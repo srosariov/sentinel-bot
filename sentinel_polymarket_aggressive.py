@@ -259,53 +259,59 @@ class BotState:
 class CoinGeckoClient:
     """
     Cliente para CoinGecko API (free tier).
-    Cachea precios para evitar rate-limit (máx 30 req/min en free tier).
+    Todas las monedas se obtienen en UNA sola llamada por ciclo,
+    eliminando rate-limit. Caché de 55 segundos (un ciclo completo).
     """
-    BASE = "https://api.coingecko.com/api/v3"
+    BASE    = "https://api.coingecko.com/api/v3"
+    ALL_IDS = "bitcoin,ethereum,solana"
 
     def __init__(self):
-        self._cache: dict = {}
-        self._cache_ts: dict = {}
-        self._cache_ttl = 30  # segundos
+        self._cache    : dict  = {}
+        self._cache_ts : float = 0.0
+        self._cache_ttl = 55   # segundos — refrescar una vez por ciclo
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "SentinelPolyBot/4.0"
 
-    def _get(self, path: str, params: dict = None) -> Optional[dict]:
+    def _refresh(self):
+        """Fetch all asset prices in a single API call."""
         try:
-            r = self.session.get(f"{self.BASE}{path}", params=params, timeout=8)
+            r = self.session.get(
+                f"{self.BASE}/simple/price",
+                params={
+                    "ids":             self.ALL_IDS,
+                    "vs_currencies":   "usd",
+                    "include_24hr_vol":"true",
+                },
+                timeout=10,
+            )
             if r.status_code == 429:
-                log.warning("CoinGecko rate limit — esperando 10s")
-                time.sleep(10)
-                return None
+                log.warning("CoinGecko rate limit — usando caché anterior")
+                return
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            for coin_id, vals in data.items():
+                self._cache[coin_id]            = float(vals["usd"])
+                self._cache[f"{coin_id}_vol"]   = float(vals.get("usd_24h_vol", 0))
+            self._cache_ts = time.time()
+            log.info(
+                f"CoinGecko actualizado — "
+                f"BTC=${self._cache.get('bitcoin',0):,.0f} "
+                f"ETH=${self._cache.get('ethereum',0):,.0f} "
+                f"SOL=${self._cache.get('solana',0):,.0f}"
+            )
         except Exception as e:
-            log.error(f"CoinGecko error: {e}")
-            return None
+            log.error(f"CoinGecko refresh error: {e}")
+
+    def _ensure_fresh(self):
+        if time.time() - self._cache_ts > self._cache_ttl:
+            self._refresh()
 
     def get_price(self, coin_id: str) -> Optional[float]:
-        """Precio actual en USD con caché de 30s."""
-        now = time.time()
-        if coin_id in self._cache and (now - self._cache_ts.get(coin_id, 0)) < self._cache_ttl:
-            return self._cache[coin_id]
-
-        data = self._get("/simple/price", {
-            "ids": coin_id,
-            "vs_currencies": "usd",
-            "include_24hr_vol": "true",
-        })
-        if data and coin_id in data:
-            price = float(data[coin_id]["usd"])
-            vol   = float(data[coin_id].get("usd_24h_vol", 0))
-            self._cache[coin_id]    = price
-            self._cache_ts[coin_id] = now
-            self._cache[f"{coin_id}_vol"] = vol
-            return price
-        return None
+        self._ensure_fresh()
+        return self._cache.get(coin_id)
 
     def get_volume_24h(self, coin_id: str) -> float:
-        """Volumen 24h en USD (se obtiene junto con el precio)."""
-        self.get_price(coin_id)  # popula el caché de vol
+        self._ensure_fresh()
         return self._cache.get(f"{coin_id}_vol", 0.0)
 
 
@@ -1103,28 +1109,48 @@ def run_scan_cycle(
 def _create_synthetic_market(asset: str, cg: CoinGeckoClient, kw: str) -> dict:
     """
     Crea un mercado sintético cuando Polymarket no devuelve datos.
-    Simula un mercado de 5 minutos con umbral cercano al precio actual.
-    """
-    cg_id  = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana"}.get(kw, "bitcoin")
-    price  = cg.get_price(cg_id) or 50000.0
 
-    # Umbral = precio actual ± 0.3% (umbral de 5 minutos realista)
+    El umbral se genera con un offset del 0.8%-2.5% del precio actual.
+    Esto asegura que el token YES/NO no esté en 0.95+, sino en un rango
+    donde el EV puede ser positivo (ej: precio real 1% por encima del umbral
+    → token YES debería estar ~0.72, pero si el mercado lo pone en 0.58 → EV=0.14).
+    """
+    cg_id = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana"}.get(kw, "bitcoin")
+    price = cg.get_price(cg_id) or 50000.0
+
+    # Offset entre 0.8% y 2.5% — suficientemente lejos para crear lag detectable
+    offset_pct = random.uniform(0.008, 0.025)
     direction  = random.choice([1, -1])
-    offset_pct = random.uniform(0.001, 0.004)
     threshold  = round(price * (1 + direction * offset_pct), 2)
+
+    # Precio sintético del token: mercado "rezagado" → price más conservador que FV
+    # Si el precio está por encima del umbral (side=YES), el token debería
+    # valer ~0.70-0.80 por fair value, pero simulamos mercado en 0.50-0.65 (lag)
+    if direction == 1:
+        # umbral arriba del precio → precio real DEBAJO del umbral → side=NO
+        # token NO debería valer ~0.70-0.85, mercado lo tiene en 0.45-0.62
+        token_fv   = random.uniform(0.70, 0.85)
+        token_mkt  = random.uniform(0.45, 0.62)   # lag: mercado no actualizó
+    else:
+        # umbral debajo del precio → precio real ARRIBA del umbral → side=YES
+        # token YES debería valer ~0.72-0.88, mercado lo tiene en 0.50-0.65
+        token_fv   = random.uniform(0.72, 0.88)
+        token_mkt  = random.uniform(0.50, 0.65)   # lag: mercado no actualizó
 
     end_time = datetime.now(timezone.utc) + timedelta(minutes=5)
 
     return {
-        "id":           f"synthetic_{asset}_{int(time.time())}",
-        "conditionId":  f"synthetic_{asset}_{int(time.time())}",
-        "question":     f"Will {asset} be above ${threshold:,.2f} at {end_time.strftime('%H:%M')} UTC?",
-        "title":        f"{asset} above ${threshold:,.2f}?",
-        "active":       True,
-        "closed":       False,
-        "endDateIso":   end_time.isoformat(),
-        "outcomePrices": None,  # Se generará precio sintético en el motor
+        "id":            f"synthetic_{asset}_{int(time.time())}",
+        "conditionId":   f"synthetic_{asset}_{int(time.time())}",
+        "question":      f"Will {asset} be above ${threshold:,.2f} at {end_time.strftime('%H:%M')} UTC?",
+        "title":         f"{asset} above ${threshold:,.2f}?",
+        "active":        True,
+        "closed":        False,
+        "endDateIso":    end_time.isoformat(),
+        # Inyectar precios sintéticos directamente para que el motor los use
+        "outcomePrices": [str(token_mkt), str(1.0 - token_mkt)],
         "tokens":        [],
+        "_synthetic_fv": token_fv,   # fair value real para depuración
     }
 
 
