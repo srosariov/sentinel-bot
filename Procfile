@@ -1,1 +1,0 @@
-worker: python sentinel_polymarket_aggressive.py
