@@ -490,26 +490,28 @@ class SignalEngine:
 
         La volatilidad anualizada estimada para cada asset:
         BTC ~60%, ETH ~70%, SOL ~90%
-        Para una vela de 5 minutos: vol = annual_vol × sqrt(5/(365*24*60))
 
-        FV se limita a 0.92 máximo — en un mercado de 5 minutos NUNCA
-        hay certeza absoluta. Incluso con precio 2% por encima del umbral,
-        un flash crash puede revertirlo. Esto refleja la realidad.
+        CALIBRACIÓN CORRECTA para mercados de 5 minutos:
+        El vol efectivo que produce una distribución realista de FV (0.60-0.88)
+        para offsets de 0.3%-1.5% es ~1.0%-1.5% del precio.
+
+        Intuición: en 5 minutos, BTC puede moverse ±1% fácilmente.
+        Un umbral al 0.5% de distancia tiene FV ~0.69 (genuina incertidumbre).
+        Un umbral al 1.2% de distancia tiene FV ~0.88 (señal más clara).
+        Esto es mucho más realista que FV=0.92 en todos los casos.
         """
-        vol_annual = {"BTC": 0.60, "ETH": 0.70, "SOL": 0.90}.get(asset, 0.65)
-        # Volatilidad para 5 minutos
-        vol_5min = vol_annual * ((5 / (365 * 24 * 60)) ** 0.5)
-        # Distancia relativa del precio actual al umbral
-        dist = (real_price - threshold) / (threshold * vol_5min)
+        # Vol efectiva por asset para mercados de 5 minutos
+        # Calibrada para producir FV entre 0.60-0.88 con offsets de 0.3%-1.5%
+        vol_effective = {"BTC": 0.010, "ETH": 0.013, "SOL": 0.018}.get(asset, 0.012)
 
-        # Función de distribución normal aproximada
+        dist = (real_price - threshold) / (threshold * vol_effective)
+
         from math import erf, sqrt
         prob_above = 0.5 * (1 + erf(dist / sqrt(2)))
 
-        # CAP REALISTA: máximo 92% de probabilidad en mercados de 5 min.
-        # Cualquier FV=1.000 es una señal de mercado sintético mal calibrado.
+        # Cap realista: máximo 88% en mercados de 5 minutos
         prob = prob_above if side == "YES" else (1 - prob_above)
-        return min(prob, 0.92)
+        return min(prob, 0.88)
 
     def calc_ev(self, fair_value: float, market_price: float) -> float:
         """
@@ -561,7 +563,7 @@ class SignalEngine:
             vol_bonus = 0.0
 
         result = fair_value + dist_bonus + vol_bonus
-        return round(min(0.95, max(0.40, result)), 4)
+        return round(min(0.92, max(0.40, result)), 4)
 
     def analyze_market(self, market_data: dict, asset: str,
                        coingecko_id: str, state: BotState) -> Optional[TradeSignal]:
@@ -649,9 +651,12 @@ class SignalEngine:
                     return None
         log.info(f"  [PASS F3-OB] {'bypass (OB vacío)' if ob_empty else 'OB activo OK'}")
 
-        # F4: Precio de entrada razonable (no apostar a 0.02 ni a 0.98)
-        if entry_price < 0.03 or entry_price > 0.97:
-            log.info(f"  [FAIL F4-PRECIO] entry={entry_price:.3f} fuera de rango 0.03-0.97")
+        # F4: Precio de entrada en rango óptimo de riesgo/reward
+        # Por debajo de 0.10: token casi sin valor, señal dudosa
+        # Por encima de 0.78: poco upside (máximo 22c), downside asimétrico
+        # Rango ideal: 0.10 - 0.78 — similar a "no comprar calls deep ITM"
+        if entry_price < 0.10 or entry_price > 0.78:
+            log.info(f"  [FAIL F4-PRECIO] entry={entry_price:.3f} fuera del rango óptimo 0.10-0.78")
             return None
         log.info(f"  [PASS F4-PRECIO] entry={entry_price:.3f} en rango válido")
 
