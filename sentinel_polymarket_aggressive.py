@@ -992,24 +992,99 @@ class TelegramBot:
             self._reply(chat_id, self.state.summary())
 
         elif text.startswith("/trades"):
+            # Closed trades history + currently open positions
+            lines = []
+
+            # ── Open positions first ──────────────────────────────────────
+            open_trades = self.state.open_trades
+            if open_trades:
+                lines.append("*Posiciones abiertas:*\n")
+                for t in open_trades:
+                    s        = t.signal
+                    elapsed  = (datetime.now(timezone.utc) - t.open_time).total_seconds() / 60
+                    unrealized = (t.exit_price - t.open_price) if t.exit_price > 0 else 0
+                    unreal_pnl = round(t.size_usdc * (unrealized / max(t.open_price, 0.001)), 4)
+                    lines.append(
+                        f"🔵 `{s.market.asset}` {s.side} "
+                        f"@ `{t.open_price:.3f}` | "
+                        f"FV `{s.fair_value:.3f}` | "
+                        f"EV `{s.ev:.3f}` | "
+                        f"Bet `${t.size_usdc:.2f}` | "
+                        f"Abierto `{elapsed:.0f}min` | "
+                        f"PnL est. `${unreal_pnl:+.2f}`"
+                    )
+                lines.append("")
+
+            # ── Closed trades ─────────────────────────────────────────────
             rows = read_last_trades(10)
-            if not rows:
-                self._reply(chat_id, "Sin trades registrados aún.")
+            if rows:
+                lines.append("*Últimos 10 trades cerrados:*\n")
+                for r in rows:
+                    pnl  = float(r.get("pnl_usdc", 0))
+                    icon = "✅" if pnl >= 0 else "❌"
+                    ev   = float(r.get("ev", 0))
+                    lines.append(
+                        f"{icon} `{r.get('asset')}` {r.get('side')} "
+                        f"entry `{r.get('entry_price')}` → `{r.get('exit_price')}` | "
+                        f"`${pnl:+.3f}` | EV `{ev:.3f}` | {r.get('exit_reason','')}"
+                    )
+            elif not open_trades:
+                lines.append("Sin trades registrados aún.")
+
+            self._reply(chat_id, "\n".join(lines))
+
+        elif text.startswith("/open"):
+            # Detailed view of currently open positions
+            open_trades = self.state.open_trades
+            if not open_trades:
+                self._reply(chat_id, "Sin posiciones abiertas en este momento.")
                 return
-            lines = ["*Últimos 10 trades:*\n"]
-            for r in rows:
-                pnl  = float(r.get("pnl_usdc", 0))
-                icon = "✅" if pnl >= 0 else "❌"
+            lines = [f"*Posiciones abiertas ({len(open_trades)}):*\n"]
+            for i, t in enumerate(open_trades, 1):
+                s       = t.signal
+                elapsed = (datetime.now(timezone.utc) - t.open_time).total_seconds() / 60
+                timeout_left = max(0, 6 - elapsed)
                 lines.append(
-                    f"{icon} `{r.get('asset')}` {r.get('side')} "
-                    f"@ `{r.get('entry_price')}` → `{r.get('exit_price')}` | "
-                    f"`${pnl:+.4f}` | {r.get('exit_reason','')}"
+                    f"*#{i} — {s.market.asset} {s.side}*\n"
+                    f"  Entrada: `{t.open_price:.3f}` | FV: `{s.fair_value:.3f}`\n"
+                    f"  EV entrada: `{s.ev:.3f}` | Score: `{s.score:.0f}`\n"
+                    f"  Bet: `${t.size_usdc:.2f}` | Modo: `{s.mode}`\n"
+                    f"  Px real entrada: `${s.market.real_price:,.2f}`\n"
+                    f"  Umbral: `${s.market.threshold:,.2f}`\n"
+                    f"  Abierto hace: `{elapsed:.1f} min`\n"
+                    f"  Timeout en: `{timeout_left:.1f} min`\n"
+                    f"  Pregunta: _{s.market.question[:60]}_"
                 )
             self._reply(chat_id, "\n".join(lines))
 
+        elif text.startswith("/pnl"):
+            # Quick PnL summary
+            rows  = read_last_trades(100)
+            total = len(rows)
+            if total == 0:
+                self._reply(chat_id, "Sin trades cerrados aún.")
+                return
+            wins   = sum(1 for r in rows if float(r.get("pnl_usdc", 0)) >= 0)
+            losses = total - wins
+            gross  = sum(float(r.get("pnl_usdc", 0)) for r in rows)
+            best   = max(float(r.get("pnl_usdc", 0)) for r in rows)
+            worst  = min(float(r.get("pnl_usdc", 0)) for r in rows)
+            avg_ev = sum(float(r.get("ev", 0)) for r in rows) / total
+            self._reply(chat_id,
+                f"*PnL Summary*\n"
+                f"────────────────\n"
+                f"Trades cerrados: `{total}`\n"
+                f"Wins: `{wins}` | Losses: `{losses}` | WR: `{wins/total:.0%}`\n"
+                f"PnL bruto: `${gross:+.4f}`\n"
+                f"Mejor trade: `${best:+.4f}`\n"
+                f"Peor trade: `${worst:+.4f}`\n"
+                f"EV promedio entrada: `{avg_ev:.3f}`\n"
+                f"Equity actual: `${self.state.equity:.2f}`"
+            )
+
         elif text.startswith("/pause"):
             self.state.paused = True
-            self._reply(chat_id, "⏸ Bot pausado.")
+            self._reply(chat_id, "⏸ Bot pausado. Las posiciones abiertas siguen activas.")
 
         elif text.startswith("/resume"):
             self.state.paused = False
@@ -1018,11 +1093,13 @@ class TelegramBot:
         elif text.startswith("/help"):
             self._reply(chat_id,
                 "*Sentinel Polymarket v4.0*\n\n"
-                "/status — Estado completo\n"
-                "/trades — Últimos 10 trades\n"
-                "/pause  — Pausar bot\n"
-                "/resume — Reanudar bot\n"
-                "/help   — Ayuda"
+                "/status  — Equity, PnL, estado completo\n"
+                "/trades  — Posiciones abiertas + últimos 10 cerrados\n"
+                "/open    — Detalle de posiciones abiertas\n"
+                "/pnl     — Resumen de PnL histórico\n"
+                "/pause   — Pausar entradas nuevas\n"
+                "/resume  — Reanudar trading\n"
+                "/help    — Esta ayuda"
             )
 
     def _poll_loop(self):
