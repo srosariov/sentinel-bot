@@ -1,1 +1,1 @@
-worker: python sentinel_polymarket_aggressive.py
+worker: python bot.py
