@@ -522,18 +522,46 @@ class SignalEngine:
     def calc_bayesian(self, fair_value: float, asset: str,
                       vol_24h: float, real_price: float, threshold: float) -> float:
         """
-        Probabilidad Bayesiana ajustada por:
-        - Confianza en el prior (precio de CoinGecko es confiable)
-        - Volatilidad del asset
-        - Distancia al umbral (cuanto más lejos, más seguro)
+        Probabilidad Bayesiana para un mercado de 5 minutos.
+
+        LÓGICA CORREGIDA:
+        El FV ya está capeado en 0.92, así que multiplicarlo por un confidence
+        bajo siempre produce ~0.60. En cambio, usamos el FV directamente como
+        base y aplicamos un ajuste aditivo por calidad de la señal:
+
+        Bayesian = FV_base + ajuste_distancia + ajuste_volumen
+
+        Donde:
+        - FV_base: el fair value ya calculado (0.65-0.92 en mercados sintéticos)
+        - ajuste_distancia: bonus si el precio está claramente del lado correcto
+          (dist > 0.5% → +0.02, dist > 1.0% → +0.05)
+        - ajuste_volumen: mercados con alto volumen 24h son más predecibles
+          (vol > $10B → +0.03)
+
+        Resultado esperado: 0.65-0.85 para señales válidas, < 0.65 cuando
+        el mercado está demasiado cerca del umbral (señal ambigua).
         """
-        # Prior fuerte: precio real está claramente por encima/debajo del umbral
         dist_pct = abs(real_price - threshold) / threshold
-        # Peso de la evidencia aumenta con distancia al umbral
-        confidence = min(0.95, 0.55 + dist_pct * 2.5)
-        # Volumen alto de CoinGecko = mercado más eficiente = prior más confiable
-        vol_factor = min(0.10, (vol_24h / 1e10) * 0.05)  # hasta +10% por alto vol
-        return min(0.98, fair_value * confidence + vol_factor)
+
+        # Ajuste por distancia: señal más clara cuando precio está más lejos
+        if dist_pct >= 0.010:       # ≥1.0% de distancia → señal fuerte
+            dist_bonus = 0.06
+        elif dist_pct >= 0.005:     # 0.5%-1.0% → señal moderada
+            dist_bonus = 0.03
+        else:                        # <0.5% → demasiado cerca, señal débil
+            dist_bonus = -0.02      # penalizar entradas cerca del umbral
+
+        # Ajuste por volumen 24h (proxy de liquidez y eficiencia del mercado)
+        # BTC ~$30B/día, ETH ~$15B/día, SOL ~$3B/día
+        if vol_24h >= 2e10:         # >$20B → mercado muy líquido
+            vol_bonus = 0.04
+        elif vol_24h >= 5e9:        # $5B-$20B
+            vol_bonus = 0.02
+        else:
+            vol_bonus = 0.0
+
+        result = fair_value + dist_bonus + vol_bonus
+        return round(min(0.95, max(0.40, result)), 4)
 
     def analyze_market(self, market_data: dict, asset: str,
                        coingecko_id: str, state: BotState) -> Optional[TradeSignal]:
