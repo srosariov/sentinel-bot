@@ -1,1 +1,1 @@
-worker: python sentinel_v3_5min_balanced.py
+worker: python sentinel_polymarket_aggressive.py
