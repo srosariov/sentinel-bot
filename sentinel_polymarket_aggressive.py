@@ -258,40 +258,54 @@ class BotState:
 
 class CoinGeckoClient:
     """
-    Cliente para CoinGecko API (free tier).
-    Todas las monedas se obtienen en UNA sola llamada por ciclo,
-    eliminando rate-limit. Caché de 55 segundos (un ciclo completo).
+    Cliente para CoinGecko API (free tier, ~30 req/min).
+    Estrategia: UNA sola llamada batch por ciclo de 60s.
+    Lock interno previene llamadas simultáneas cuando los 3 assets
+    llaman a get_price() en el mismo ciclo.
+    TTL = 90s — más conservador que el ciclo de 60s para evitar rate-limit.
     """
     BASE    = "https://api.coingecko.com/api/v3"
     ALL_IDS = "bitcoin,ethereum,solana"
 
     def __init__(self):
-        self._cache    : dict  = {}
-        self._cache_ts : float = 0.0
-        self._cache_ttl = 55   # segundos — refrescar una vez por ciclo
+        self._cache     : dict  = {}
+        self._cache_ts  : float = 0.0
+        self._cache_ttl : float = 90.0   # 90s — conservador para free tier
+        self._refreshing: bool  = False   # lock simple anti-duplicado
         self.session = requests.Session()
         self.session.headers["User-Agent"] = "SentinelPolyBot/4.0"
 
-    def _refresh(self):
-        """Fetch all asset prices in a single API call."""
+    def prefetch(self):
+        """
+        Llamar UNA VEZ al inicio de cada ciclo de escaneo.
+        Refresca el caché si hace más de TTL segundos.
+        Todos los get_price() del ciclo usarán este caché.
+        """
+        if self._refreshing:
+            return
+        if time.time() - self._cache_ts <= self._cache_ttl:
+            return   # caché aún válido
+        self._refreshing = True
         try:
             r = self.session.get(
                 f"{self.BASE}/simple/price",
                 params={
-                    "ids":             self.ALL_IDS,
-                    "vs_currencies":   "usd",
-                    "include_24hr_vol":"true",
+                    "ids":              self.ALL_IDS,
+                    "vs_currencies":    "usd",
+                    "include_24hr_vol": "true",
                 },
-                timeout=10,
+                timeout=12,
             )
             if r.status_code == 429:
-                log.warning("CoinGecko rate limit — usando caché anterior")
+                log.warning("CoinGecko rate limit — manteniendo caché anterior")
+                # Back off: extender el TTL 60s más para no seguir golpeando
+                self._cache_ts = time.time() - self._cache_ttl + 60
                 return
             r.raise_for_status()
             data = r.json()
             for coin_id, vals in data.items():
-                self._cache[coin_id]            = float(vals["usd"])
-                self._cache[f"{coin_id}_vol"]   = float(vals.get("usd_24h_vol", 0))
+                self._cache[coin_id]          = float(vals["usd"])
+                self._cache[f"{coin_id}_vol"] = float(vals.get("usd_24h_vol", 0))
             self._cache_ts = time.time()
             log.info(
                 f"CoinGecko actualizado — "
@@ -301,17 +315,15 @@ class CoinGeckoClient:
             )
         except Exception as e:
             log.error(f"CoinGecko refresh error: {e}")
-
-    def _ensure_fresh(self):
-        if time.time() - self._cache_ts > self._cache_ttl:
-            self._refresh()
+        finally:
+            self._refreshing = False
 
     def get_price(self, coin_id: str) -> Optional[float]:
-        self._ensure_fresh()
+        """Devuelve precio del caché. Llamar prefetch() antes del ciclo."""
         return self._cache.get(coin_id)
 
     def get_volume_24h(self, coin_id: str) -> float:
-        self._ensure_fresh()
+        """Devuelve volumen 24h del caché."""
         return self._cache.get(f"{coin_id}_vol", 0.0)
 
 
@@ -1097,6 +1109,10 @@ def run_scan_cycle(
     log.info(f"━━━ CICLO #{state.cycles_run} | Modo: {'RELAJADO' if state.relaxed_mode else 'NORMAL'} | "
              f"EV>={state.ev_threshold:.0%} Bayes>={state.bayesian_threshold:.0%} ━━━")
 
+    # ── Prefetch prices ONCE per cycle ───────────────────────────────────────
+    # Todos los get_price() del ciclo usan este caché — cero requests extra
+    cg.prefetch()
+
     # ── Gestionar posiciones abiertas primero ────────────────────────────────
     for trade in list(state.open_trades):
         cg_id = next(
@@ -1264,6 +1280,10 @@ def main():
     poly   = PolymarketClient()
     engine = SignalEngine(cg)
     trader = PaperTrader(poly, cg)
+
+    # Pre-cargar precios al arrancar para que el ciclo #1 tenga datos
+    log.info("Pre-cargando precios de CoinGecko...")
+    cg.prefetch()
 
     # ── Telegram ──────────────────────────────────────────────────────────────
     tg_app = None
