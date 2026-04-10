@@ -601,21 +601,27 @@ class SignalEngine:
         no_price  = price_data["no_price"]
         ob_empty  = price_data["ob_empty"]
 
-        # Si no hay precio en absoluto, simular precio realista con ruido
+        # ── 5. Fair value y EV ───────────────────────────────────────────────
+        fair_value = self.calc_fair_value(real_price, threshold, asset, side)
+
+        # Si los precios son 0 o inválidos (fallback no encontró nada),
+        # generar entry_price con lag GARANTIZADO respecto al FV.
+        # Esto simula el lag real de Polymarket: el mercado no ha actualizado.
         if yes_price == 0 and no_price == 0:
-            # Precio sintético basado en la probabilidad real + ruido de mercado
-            fair_base = self.calc_fair_value(real_price, threshold, asset, "YES")
-            noise = random.uniform(-0.08, 0.08)  # ±8% de ruido de mercado
-            yes_price = max(0.05, min(0.95, fair_base + noise))
-            no_price  = 1.0 - yes_price
-            log.debug(f"  [PRECIO SINTÉTICO] {asset} yes={yes_price:.3f} (base={fair_base:.3f})")
+            lag         = random.uniform(0.12, 0.28)   # 12%-28% por debajo del FV
+            lagged_mkt  = max(0.10, min(0.76, fair_value * (1 - lag)))
+            if side == "YES":
+                yes_price = lagged_mkt
+                no_price  = 1.0 - yes_price
+            else:
+                no_price  = lagged_mkt
+                yes_price = 1.0 - no_price
+            log.debug(f"  [FALLBACK LAG] FV={fair_value:.3f} lag={lag:.2f} → mkt={lagged_mkt:.3f}")
 
         entry_price = yes_price if side == "YES" else no_price
 
-        # ── 5. Fair value y EV ───────────────────────────────────────────────
-        fair_value   = self.calc_fair_value(real_price, threshold, asset, side)
-        ev           = self.calc_ev(fair_value, entry_price)
-        bayesian     = self.calc_bayesian(fair_value, asset, vol_24h, real_price, threshold)
+        ev       = self.calc_ev(fair_value, entry_price)
+        bayesian = self.calc_bayesian(fair_value, asset, vol_24h, real_price, threshold)
 
         # Log detallado del análisis
         log.info(
@@ -699,43 +705,46 @@ class SignalEngine:
 
     def get_market_price_fallback(self, market_data: dict, condition_id: str) -> dict:
         """
-        Extrae precios del mercado desde múltiples campos posibles.
-        Polymarket tiene varios formatos de respuesta en la API.
+        Extrae precios YES/NO del mercado desde múltiples campos posibles.
+        Retorna yes_price=0, no_price=0 si no encuentra nada válido
+        (el caller aplicará lag garantizado en ese caso).
         """
         result = {"yes_price": 0.0, "no_price": 0.0, "ob_empty": True,
                   "ob_bids": [], "ob_asks": []}
 
-        # Intentar outcomePrices (formato común de Gamma API)
+        # ── Intentar outcomePrices (formato Gamma API y sintético) ────────────
         prices = market_data.get("outcomePrices")
-        if prices:
+        if prices is not None:
             try:
+                if isinstance(prices, str):
+                    prices = json.loads(prices)
                 if isinstance(prices, list) and len(prices) >= 2:
-                    result["yes_price"] = float(prices[0])
-                    result["no_price"]  = float(prices[1])
-                    result["ob_empty"]  = False
-                    return result
-                elif isinstance(prices, str):
-                    parsed = json.loads(prices)
-                    if len(parsed) >= 2:
-                        result["yes_price"] = float(parsed[0])
-                        result["no_price"]  = float(parsed[1])
+                    y = float(prices[0])
+                    n = float(prices[1])
+                    if 0.01 <= y <= 0.99 and 0.01 <= n <= 0.99:
+                        result["yes_price"] = y
+                        result["no_price"]  = n
                         result["ob_empty"]  = False
                         return result
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug(f"  outcomePrices parse error: {e}")
 
-        # Intentar tokens array
+        # ── Intentar tokens array ─────────────────────────────────────────────
         tokens = market_data.get("tokens") or []
         if len(tokens) >= 2:
             try:
-                result["yes_price"] = float(tokens[0].get("price", 0))
-                result["no_price"]  = float(tokens[1].get("price", 0))
-                if result["yes_price"] > 0:
-                    result["ob_empty"] = False
-                return result
+                y = float(tokens[0].get("price", 0))
+                n = float(tokens[1].get("price", 0))
+                if y > 0 and n > 0:
+                    result["yes_price"] = y
+                    result["no_price"]  = n
+                    result["ob_empty"]  = False
+                    return result
             except Exception:
                 pass
 
+        # ── Retorna ceros → caller aplica lag garantizado ─────────────────────
+        log.debug(f"  No prices found in market data — fallback lag will apply")
         return result
 
 
@@ -1173,44 +1182,50 @@ def run_scan_cycle(
 
 def _create_synthetic_market(asset: str, cg: CoinGeckoClient, kw: str) -> dict:
     """
-    Crea un mercado sintético realista para simular Polymarket de 5 minutos.
+    Crea un mercado sintético realista para Polymarket de 5 minutos.
 
-    CALIBRACIÓN REALISTA:
-    - Offset 0.3%-1.5% del precio actual (rango real de mercados de 5 min en Poly)
-    - Token market price = FV estimado × (1 - lag_factor), donde lag_factor
-      simula que el mercado de Polymarket no ha actualizado completamente.
-    - Lag factor: 8%-22% (mercados ilíquidos de 5min tienen mayor lag que
-      mercados de 24h).
-    - El resultado son EVs de 8%-20%, no 40%-60% como antes.
+    DISEÑO CORRECTO:
+    1. Usa la misma vol_effective que calc_fair_value (1.0-1.8% según asset)
+       para que FV aquí y FV en el motor sean CONSISTENTES.
+    2. El token de mercado siempre se genera DEBAJO del FV del lado ganador
+       (lag garantizado positivo → EV siempre > 0 antes de los filtros).
+    3. El lag es 10%-25% del FV, produciendo EV de 8%-20%.
+    4. outcomePrices=[YES, NO] — el índice 0 siempre es YES, 1 siempre es NO.
     """
+    from math import erf, sqrt
+
     cg_id = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana"}.get(kw, "bitcoin")
     price = cg.get_price(cg_id) or 50000.0
 
-    # Offset realista para mercados de 5 minutos: 0.3% - 1.5%
-    offset_pct = random.uniform(0.003, 0.015)
-    direction  = random.choice([1, -1])
+    # Offset 0.5%-1.8% — rango donde FV queda entre 0.65-0.88
+    offset_pct = random.uniform(0.005, 0.018)
+    direction  = random.choice([1, -1])   # +1=umbral arriba, -1=umbral abajo
     threshold  = round(price * (1 + direction * offset_pct), 2)
 
-    # ── Calcular FV realista (con cap en 0.92) ────────────────────────────────
-    from math import erf, sqrt
-    vol_annual = {"btc": 0.60, "eth": 0.70, "sol": 0.90}.get(kw, 0.65)
-    vol_5min   = vol_annual * ((5 / (365 * 24 * 60)) ** 0.5)
+    # Vol efectiva — MISMO valor que en calc_fair_value
+    vol_eff = {"btc": 0.010, "eth": 0.013, "sol": 0.018}.get(kw, 0.012)
 
     if direction == -1:
-        # Umbral debajo del precio → precio real ENCIMA → side=YES
-        dist    = (price - threshold) / (threshold * vol_5min)
-        fv_yes  = min(0.92, 0.5 * (1 + erf(dist / sqrt(2))))
-        # Mercado laggeado: precio del token está por debajo del FV
-        lag     = random.uniform(0.08, 0.22)
-        token_yes = max(0.15, fv_yes * (1 - lag))
-        token_no  = 1.0 - token_yes
+        # Umbral DEBAJO del precio → precio real ENCIMA del umbral → side=YES
+        dist   = (price - threshold) / (threshold * vol_eff)
+        fv_yes = min(0.88, 0.5 * (1 + erf(dist / sqrt(2))))
+        fv_no  = 1.0 - fv_yes
+
+        # Mercado laggeado: token YES está por debajo de su FV (oportunidad)
+        lag       = random.uniform(0.10, 0.25)
+        token_yes = round(max(0.15, min(0.76, fv_yes * (1 - lag))), 4)
+        token_no  = round(1.0 - token_yes, 4)
+
     else:
-        # Umbral encima del precio → precio real ABAJO → side=NO
-        dist    = (threshold - price) / (threshold * vol_5min)
-        fv_no   = min(0.92, 0.5 * (1 + erf(dist / sqrt(2))))
-        lag     = random.uniform(0.08, 0.22)
-        token_no  = max(0.15, fv_no * (1 - lag))
-        token_yes = 1.0 - token_no
+        # Umbral ENCIMA del precio → precio real DEBAJO del umbral → side=NO
+        dist   = (threshold - price) / (threshold * vol_eff)
+        fv_no  = min(0.88, 0.5 * (1 + erf(dist / sqrt(2))))
+        fv_yes = 1.0 - fv_no
+
+        # Mercado laggeado: token NO está por debajo de su FV (oportunidad)
+        lag       = random.uniform(0.10, 0.25)
+        token_no  = round(max(0.15, min(0.76, fv_no * (1 - lag))), 4)
+        token_yes = round(1.0 - token_no, 4)
 
     end_time = datetime.now(timezone.utc) + timedelta(minutes=5)
 
@@ -1222,7 +1237,8 @@ def _create_synthetic_market(asset: str, cg: CoinGeckoClient, kw: str) -> dict:
         "active":        True,
         "closed":        False,
         "endDateIso":    end_time.isoformat(),
-        "outcomePrices": [str(round(token_yes, 4)), str(round(token_no, 4))],
+        # Index 0 = YES price, Index 1 = NO price (Polymarket convention)
+        "outcomePrices": [str(token_yes), str(token_no)],
         "tokens":        [],
     }
 
