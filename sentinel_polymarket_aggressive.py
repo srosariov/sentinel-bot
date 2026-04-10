@@ -21,10 +21,7 @@ import os
 import csv
 import time
 import logging
-import asyncio
 import threading
-import hashlib
-import hmac
 import json
 import random
 from datetime import datetime, timezone, timedelta
@@ -32,8 +29,6 @@ from typing import Optional
 from dataclasses import dataclass, field
 
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN
@@ -843,92 +838,160 @@ def read_last_trades(n: int = 10) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM
+# TELEGRAM — Pure HTTP, zero dependencies, works on any Python version
 # ─────────────────────────────────────────────────────────────────────────────
 
-def send_telegram(app, text: str):
-    if not TELEGRAM_TOKEN or "YOUR_" in TELEGRAM_TOKEN:
-        log.info(f"[TG] {text[:80]}")
+class TelegramBot:
+    """
+    Telegram bot implementation using raw HTTP calls to the Bot API.
+    No python-telegram-bot dependency — fully compatible with Python 3.13+.
+    Commands are polled in a background thread.
+    """
+    BASE = "https://api.telegram.org/bot"
+
+    def __init__(self, token: str, chat_id: str, state: BotState):
+        self.token   = token
+        self.chat_id = chat_id
+        self.state   = state
+        self.session = requests.Session()
+        self.offset  = 0       # long-poll offset
+        self._stop   = False
+
+    def _url(self, method: str) -> str:
+        return f"{self.BASE}{self.token}/{method}"
+
+    def send(self, text: str) -> bool:
+        """Send a message. Safe to call from any thread."""
+        if not self.token or "YOUR_" in self.token:
+            log.info(f"[TG] {text[:80]}")
+            return False
+        try:
+            r = self.session.post(
+                self._url("sendMessage"),
+                json={
+                    "chat_id":    self.chat_id,
+                    "text":       text,
+                    "parse_mode": "Markdown",
+                },
+                timeout=10,
+            )
+            return r.json().get("ok", False)
+        except Exception as e:
+            log.error(f"Telegram send error: {e}")
+            return False
+
+    def _reply(self, chat_id: int, text: str):
+        """Reply to a specific chat (used by command handler)."""
+        try:
+            self.session.post(
+                self._url("sendMessage"),
+                json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+                timeout=10,
+            )
+        except Exception as e:
+            log.error(f"Telegram reply error: {e}")
+
+    def _handle_command(self, message: dict):
+        """Dispatch incoming command to the right handler."""
+        text    = (message.get("text") or "").strip().lower()
+        chat_id = message["chat"]["id"]
+
+        if text.startswith("/status"):
+            self._reply(chat_id, self.state.summary())
+
+        elif text.startswith("/trades"):
+            rows = read_last_trades(10)
+            if not rows:
+                self._reply(chat_id, "Sin trades registrados aún.")
+                return
+            lines = ["*Últimos 10 trades:*\n"]
+            for r in rows:
+                pnl  = float(r.get("pnl_usdc", 0))
+                icon = "✅" if pnl >= 0 else "❌"
+                lines.append(
+                    f"{icon} `{r.get('asset')}` {r.get('side')} "
+                    f"@ `{r.get('entry_price')}` → `{r.get('exit_price')}` | "
+                    f"`${pnl:+.4f}` | {r.get('exit_reason','')}"
+                )
+            self._reply(chat_id, "\n".join(lines))
+
+        elif text.startswith("/pause"):
+            self.state.paused = True
+            self._reply(chat_id, "⏸ Bot pausado.")
+
+        elif text.startswith("/resume"):
+            self.state.paused = False
+            self._reply(chat_id, "▶ Bot reanudado.")
+
+        elif text.startswith("/help"):
+            self._reply(chat_id,
+                "*Sentinel Polymarket v4.0*\n\n"
+                "/status — Estado completo\n"
+                "/trades — Últimos 10 trades\n"
+                "/pause  — Pausar bot\n"
+                "/resume — Reanudar bot\n"
+                "/help   — Ayuda"
+            )
+
+    def _poll_loop(self):
+        """
+        Long-polling loop running in a background daemon thread.
+        Fetches updates every 2 seconds with a 30s timeout.
+        """
+        log.info("Telegram polling thread iniciado")
+        while not self._stop:
+            try:
+                r = self.session.get(
+                    self._url("getUpdates"),
+                    params={"offset": self.offset, "timeout": 30, "limit": 10},
+                    timeout=35,
+                )
+                data = r.json()
+                if not data.get("ok"):
+                    time.sleep(5)
+                    continue
+                for update in data.get("result", []):
+                    self.offset = update["update_id"] + 1
+                    msg = update.get("message") or update.get("edited_message")
+                    if msg and msg.get("text", "").startswith("/"):
+                        self._handle_command(msg)
+            except Exception as e:
+                log.error(f"Telegram poll error: {e}")
+                time.sleep(5)
+
+    def start_polling(self):
+        """Start the polling thread. Call once during bot init."""
+        # Flush pending updates so old commands don't trigger on restart
+        try:
+            self.session.get(
+                self._url("getUpdates"),
+                params={"offset": -1, "timeout": 1},
+                timeout=5,
+            )
+        except Exception:
+            pass
+        t = threading.Thread(target=self._poll_loop, daemon=True)
+        t.start()
+
+    def stop(self):
+        self._stop = True
+
+
+# ── Convenience wrapper so call sites don't need to change ───────────────────
+
+def send_telegram(tg: Optional["TelegramBot"], text: str):
+    """Send a Telegram message. tg can be None (Telegram not configured)."""
+    if tg is None:
+        log.info(f"[TG skip] {text[:80]}")
         return
-    try:
-        loop = getattr(app, "_loop", None)
-        if loop and not loop.is_closed():
-            asyncio.run_coroutine_threadsafe(
-                app.bot.send_message(
-                    chat_id    = TELEGRAM_CHAT_ID,
-                    text       = text,
-                    parse_mode = "Markdown",
-                ),
-                loop,
-            )
-    except Exception as e:
-        log.error(f"Telegram send error: {e}")
+    tg.send(text)
 
 
-def build_telegram(state: BotState) -> Application:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text(state.summary(), parse_mode="Markdown")
-
-    async def cmd_trades(u: Update, c: ContextTypes.DEFAULT_TYPE):
-        rows = read_last_trades(10)
-        if not rows:
-            await u.message.reply_text("Sin trades registrados aún.")
-            return
-        lines = ["*Últimos 10 trades:*\n"]
-        for r in rows:
-            pnl  = float(r.get("pnl_usdc", 0))
-            icon = "✅" if pnl >= 0 else "❌"
-            lines.append(
-                f"{icon} `{r.get('asset')}` {r.get('side')} "
-                f"@ `{r.get('entry_price')}` → `{r.get('exit_price')}` | "
-                f"`${pnl:+.4f}` | {r.get('exit_reason','')}"
-            )
-        await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    async def cmd_pause(u: Update, c: ContextTypes.DEFAULT_TYPE):
-        state.paused = True
-        await u.message.reply_text("⏸ Bot pausado.")
-
-    async def cmd_resume(u: Update, c: ContextTypes.DEFAULT_TYPE):
-        state.paused = False
-        await u.message.reply_text("▶ Bot reanudado.")
-
-    async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE):
-        await u.message.reply_text(
-            "*Sentinel Polymarket v4.0*\n\n"
-            "/status — Estado completo\n"
-            "/trades — Últimos 10 trades\n"
-            "/pause  — Pausar bot\n"
-            "/resume — Reanudar bot\n"
-            "/help   — Ayuda",
-            parse_mode="Markdown",
-        )
-
-    for cmd, fn in [
-        ("status", cmd_status), ("trades", cmd_trades),
-        ("pause",  cmd_pause),  ("resume", cmd_resume),
-        ("help",   cmd_help),
-    ]:
-        app.add_handler(CommandHandler(cmd, fn))
-    return app
-
-
-def run_telegram_thread(app: Application):
-    async def _run():
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        await asyncio.Event().wait()
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    app._loop = loop
-    try:
-        loop.run_until_complete(_run())
-    except Exception as e:
-        log.error(f"Telegram loop error: {e}")
+def build_telegram(state: BotState) -> "TelegramBot":
+    """Build and start a TelegramBot instance."""
+    bot = TelegramBot(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, state)
+    bot.start_polling()
+    return bot
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1091,10 +1154,8 @@ def main():
     tg_app = None
     if TELEGRAM_TOKEN and "YOUR_" not in TELEGRAM_TOKEN:
         tg_app = build_telegram(state)
-        t = threading.Thread(target=run_telegram_thread, args=(tg_app,), daemon=True)
-        t.start()
-        time.sleep(2)
-        log.info("Telegram bot iniciado")
+        time.sleep(1)
+        log.info("Telegram bot iniciado (HTTP polling, sin dependencias externas)")
 
     send_telegram(tg_app,
         f"*Sentinel Polymarket v4.0 INICIADO*\n"
@@ -1133,6 +1194,8 @@ def main():
         except KeyboardInterrupt:
             log.info("Apagado por usuario")
             send_telegram(tg_app, "Bot detenido manualmente.")
+            if tg_app:
+                tg_app.stop()
             break
 
         except Exception as e:
