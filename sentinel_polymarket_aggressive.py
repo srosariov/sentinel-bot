@@ -491,6 +491,10 @@ class SignalEngine:
         La volatilidad anualizada estimada para cada asset:
         BTC ~60%, ETH ~70%, SOL ~90%
         Para una vela de 5 minutos: vol = annual_vol × sqrt(5/(365*24*60))
+
+        FV se limita a 0.92 máximo — en un mercado de 5 minutos NUNCA
+        hay certeza absoluta. Incluso con precio 2% por encima del umbral,
+        un flash crash puede revertirlo. Esto refleja la realidad.
         """
         vol_annual = {"BTC": 0.60, "ETH": 0.70, "SOL": 0.90}.get(asset, 0.65)
         # Volatilidad para 5 minutos
@@ -502,7 +506,10 @@ class SignalEngine:
         from math import erf, sqrt
         prob_above = 0.5 * (1 + erf(dist / sqrt(2)))
 
-        return prob_above if side == "YES" else (1 - prob_above)
+        # CAP REALISTA: máximo 92% de probabilidad en mercados de 5 min.
+        # Cualquier FV=1.000 es una señal de mercado sintético mal calibrado.
+        prob = prob_above if side == "YES" else (1 - prob_above)
+        return min(prob, 0.92)
 
     def calc_ev(self, fair_value: float, market_price: float) -> float:
         """
@@ -732,62 +739,87 @@ class PaperTrader:
     def check_resolve(self, trade: OpenTrade, state: BotState,
                       coingecko_id: str) -> bool:
         """
-        Verifica si una posición debe cerrarse.
-        Condiciones de cierre:
-        1. La posición llegó al timeout (6 min) → resolver por precio real
-        2. Precio del token alcanzó target de profit (>0.85 desde entry < 0.70)
-        3. Precio cayó al stop-loss simulado (<= entry * 0.70)
-        """
-        now      = datetime.now(timezone.utc)
-        elapsed  = (now - trade.open_time).total_seconds() / 60
-        signal   = trade.signal
-        asset    = signal.market.asset
-        threshold= signal.market.threshold
+        Simula la resolución realista de un trade de Polymarket de 5 minutos.
 
-        # Obtener precio real actual
+        MODELO REALISTA:
+        - El precio del token converge gradualmente hacia FV, NO de golpe.
+        - En cada ciclo el token se mueve una fracción pequeña (convergencia parcial).
+        - Hay ruido de mercado genuino que puede causar pérdidas aunque FV sea alto.
+        - El precio real de BTC/ETH/SOL puede haberse movido desde la entrada,
+          cambiando el FV — se recalcula con el precio ACTUAL, no el de entrada.
+        - Stop-loss realista al 40% de pérdida sobre el capital apostado.
+        - Timeout de 6 minutos cierra al precio corriente (win o loss).
+        """
+        now     = datetime.now(timezone.utc)
+        elapsed = (now - trade.open_time).total_seconds() / 60
+        signal  = trade.signal
+        asset   = signal.market.asset
+        threshold = signal.market.threshold
+
+        # ── Precio real ACTUAL (puede haber cambiado desde la entrada) ────────
         real_price = self.cg.get_price(coingecko_id)
         if real_price is None:
             return False
 
-        # Calcular precio implícito actual del token
-        # Usar la misma fórmula de fair_value para simular resolución
-        engine = SignalEngine(self.cg)
+        # ── Recalcular FV con precio actual — refleja movimiento real del mercado
+        engine     = SignalEngine(self.cg)
         current_fv = engine.calc_fair_value(real_price, threshold, asset, signal.side)
 
-        # Ruido de mercado simulado (Polymarket no siempre converge inmediatamente)
-        noise = random.uniform(-0.04, 0.04)
-        current_token_price = max(0.02, min(0.98, current_fv + noise))
+        # ── Convergencia gradual del token hacia FV ───────────────────────────
+        # En cada ciclo de 60s, el token se mueve ~20-40% de la distancia al FV.
+        # Esto simula cómo los market makers en Polymarket ajustan precios
+        # gradualmente, no instantáneamente.
+        convergence_rate = random.uniform(0.20, 0.40)
+        prev_price       = trade.exit_price if trade.exit_price > 0 else signal.entry_price
+
+        # Movimiento hacia FV + ruido independiente (spreads, liquidez escasa)
+        # El ruido es mayor para SOL (más volátil) que para BTC
+        noise_scale = {"BTC": 0.025, "ETH": 0.035, "SOL": 0.055}.get(asset, 0.03)
+        noise       = random.gauss(0, noise_scale)   # ruido gaussiano, no uniforme
+
+        # Precio del token este ciclo
+        direction_move = (current_fv - prev_price) * convergence_rate
+        current_token  = max(0.03, min(0.97, prev_price + direction_move + noise))
+
+        # Actualizar precio corriente en el trade para el próximo ciclo
+        trade.exit_price = current_token
 
         resolved   = False
-        exit_price = current_token_price
+        exit_price = current_token
         reason     = ""
 
-        # Condición 1: Timeout
+        # ── Condición 1: Timeout — cierra AL PRECIO CORRIENTE (win o loss) ────
         if elapsed >= POSITION_TIMEOUT_MINS:
             resolved = True
             reason   = f"timeout_{elapsed:.1f}min"
 
-        # Condición 2: Target de profit (token subió 25%+ desde entrada)
-        elif current_token_price >= min(0.90, signal.entry_price * 1.25):
+        # ── Condición 2: Target de profit realista ────────────────────────────
+        # El token llegó a 0.85+ (cerca de certeza), tomar profit
+        elif current_token >= 0.85:
             resolved = True
             reason   = "target_profit"
 
-        # Condición 3: Stop-loss (token bajó 30%+ desde entrada)
-        elif current_token_price <= signal.entry_price * 0.70:
+        # ── Condición 3: Stop-loss — perdió 40% del capital ──────────────────
+        # En Polymarket real, puedes vender el token antes de expiración.
+        # Si el token cayó 40% desde la entrada, salir con pérdida controlada.
+        elif current_token <= signal.entry_price * 0.60:
             resolved = True
             reason   = "stop_loss"
 
         if resolved:
-            # PnL = (exit_price - entry_price) / entry_price × bet_size
+            # PnL = (exit - entry) / entry × bet_size
+            # Si exit > entry → ganancia; si exit < entry → pérdida
             pnl_pct  = (exit_price - signal.entry_price) / signal.entry_price
             pnl_usdc = round(trade.size_usdc * pnl_pct, 4)
             trade.resolved    = True
             trade.exit_price  = exit_price
             trade.pnl         = pnl_usdc
             trade.exit_reason = reason
+            result_icon = "WIN" if pnl_usdc >= 0 else "LOSS"
             log.info(
-                f"TRADE CERRADO — {asset} {signal.side} | "
+                f"TRADE CERRADO [{result_icon}] — {asset} {signal.side} | "
                 f"Entry={signal.entry_price:.3f} Exit={exit_price:.3f} | "
+                f"FV_actual={current_fv:.3f} | "
                 f"PnL=${pnl_usdc:+.4f} ({pnl_pct:+.1%}) | Razón: {reason}"
             )
 
@@ -1108,34 +1140,44 @@ def run_scan_cycle(
 
 def _create_synthetic_market(asset: str, cg: CoinGeckoClient, kw: str) -> dict:
     """
-    Crea un mercado sintético cuando Polymarket no devuelve datos.
+    Crea un mercado sintético realista para simular Polymarket de 5 minutos.
 
-    El umbral se genera con un offset del 0.8%-2.5% del precio actual.
-    Esto asegura que el token YES/NO no esté en 0.95+, sino en un rango
-    donde el EV puede ser positivo (ej: precio real 1% por encima del umbral
-    → token YES debería estar ~0.72, pero si el mercado lo pone en 0.58 → EV=0.14).
+    CALIBRACIÓN REALISTA:
+    - Offset 0.3%-1.5% del precio actual (rango real de mercados de 5 min en Poly)
+    - Token market price = FV estimado × (1 - lag_factor), donde lag_factor
+      simula que el mercado de Polymarket no ha actualizado completamente.
+    - Lag factor: 8%-22% (mercados ilíquidos de 5min tienen mayor lag que
+      mercados de 24h).
+    - El resultado son EVs de 8%-20%, no 40%-60% como antes.
     """
     cg_id = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana"}.get(kw, "bitcoin")
     price = cg.get_price(cg_id) or 50000.0
 
-    # Offset entre 0.8% y 2.5% — suficientemente lejos para crear lag detectable
-    offset_pct = random.uniform(0.008, 0.025)
+    # Offset realista para mercados de 5 minutos: 0.3% - 1.5%
+    offset_pct = random.uniform(0.003, 0.015)
     direction  = random.choice([1, -1])
     threshold  = round(price * (1 + direction * offset_pct), 2)
 
-    # Precio sintético del token: mercado "rezagado" → price más conservador que FV
-    # Si el precio está por encima del umbral (side=YES), el token debería
-    # valer ~0.70-0.80 por fair value, pero simulamos mercado en 0.50-0.65 (lag)
-    if direction == 1:
-        # umbral arriba del precio → precio real DEBAJO del umbral → side=NO
-        # token NO debería valer ~0.70-0.85, mercado lo tiene en 0.45-0.62
-        token_fv   = random.uniform(0.70, 0.85)
-        token_mkt  = random.uniform(0.45, 0.62)   # lag: mercado no actualizó
+    # ── Calcular FV realista (con cap en 0.92) ────────────────────────────────
+    from math import erf, sqrt
+    vol_annual = {"btc": 0.60, "eth": 0.70, "sol": 0.90}.get(kw, 0.65)
+    vol_5min   = vol_annual * ((5 / (365 * 24 * 60)) ** 0.5)
+
+    if direction == -1:
+        # Umbral debajo del precio → precio real ENCIMA → side=YES
+        dist    = (price - threshold) / (threshold * vol_5min)
+        fv_yes  = min(0.92, 0.5 * (1 + erf(dist / sqrt(2))))
+        # Mercado laggeado: precio del token está por debajo del FV
+        lag     = random.uniform(0.08, 0.22)
+        token_yes = max(0.15, fv_yes * (1 - lag))
+        token_no  = 1.0 - token_yes
     else:
-        # umbral debajo del precio → precio real ARRIBA del umbral → side=YES
-        # token YES debería valer ~0.72-0.88, mercado lo tiene en 0.50-0.65
-        token_fv   = random.uniform(0.72, 0.88)
-        token_mkt  = random.uniform(0.50, 0.65)   # lag: mercado no actualizó
+        # Umbral encima del precio → precio real ABAJO → side=NO
+        dist    = (threshold - price) / (threshold * vol_5min)
+        fv_no   = min(0.92, 0.5 * (1 + erf(dist / sqrt(2))))
+        lag     = random.uniform(0.08, 0.22)
+        token_no  = max(0.15, fv_no * (1 - lag))
+        token_yes = 1.0 - token_no
 
     end_time = datetime.now(timezone.utc) + timedelta(minutes=5)
 
@@ -1147,10 +1189,8 @@ def _create_synthetic_market(asset: str, cg: CoinGeckoClient, kw: str) -> dict:
         "active":        True,
         "closed":        False,
         "endDateIso":    end_time.isoformat(),
-        # Inyectar precios sintéticos directamente para que el motor los use
-        "outcomePrices": [str(token_mkt), str(1.0 - token_mkt)],
+        "outcomePrices": [str(round(token_yes, 4)), str(round(token_no, 4))],
         "tokens":        [],
-        "_synthetic_fv": token_fv,   # fair value real para depuración
     }
 
 
