@@ -1,5 +1,0 @@
-# Sentinel Polymarket Bot v6.0 — requirements
-# Only two real dependencies; everything else is stdlib.
-
-requests==2.31.0
-urllib3==2.2.1
