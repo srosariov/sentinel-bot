@@ -55,7 +55,7 @@ DISCORD_WEBHOOK    = os.getenv("DISCORD_WEBHOOK_URL", "")
 PAPER_MODE         = os.getenv("PAPER_MODE", "true").lower() != "false"
 INITIAL_BANKROLL   = float(os.getenv("INITIAL_BANKROLL", "100.0"))
 TRADE_FRACTION     = float(os.getenv("TRADE_FRACTION",   "0.05"))
-MAX_OPEN_TRADES    = int(os.getenv("MAX_OPEN_TRADES",    "4"))
+MAX_OPEN_TRADES    = int(os.getenv("MAX_OPEN_TRADES",    "8"))
 CB_PCT             = float(os.getenv("CIRCUIT_BREAKER_PCT", "0.20"))
 CYCLE_SLEEP        = int(os.getenv("CYCLE_SLEEP",        "60"))
 CSV_FILE           = os.getenv("CSV_FILE",               "trades_v7.csv")
