@@ -63,7 +63,7 @@ RELAXED_AFTER_MINS = int(os.getenv("RELAXED_AFTER_MINS", "15"))
 
 # Filtros / Thresholds
 EV_NORMAL     = float(os.getenv("EV_NORMAL",     "0.050"))
-EV_RELAXED    = float(os.getenv("EV_RELAXED",    "0.035"))
+EV_RELAXED    = float(os.getenv("EV_RELAXED",    "0.025"))
 BAYES_NORMAL  = float(os.getenv("BAYES_NORMAL",  "0.580"))
 BAYES_RELAXED = float(os.getenv("BAYES_RELAXED", "0.520"))
 
@@ -87,7 +87,7 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 CG_BASE    = "https://api.coingecko.com/api/v3/simple/price"
 
 # Factor de regresión al 50% en el modelo de señal (ver analyze())
-FADE_FACTOR = 0.35
+FADE_FACTOR = 0.52
 
 # ──────────────────────────────────────────────────────────────────────────────
 # HTTP SESSION (con reintentos y User-Agent)
