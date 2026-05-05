@@ -1,5 +1,0 @@
-# Sentinel Polymarket v7.0 — dependencias mínimas
-# Solo requests. Todo lo demás es stdlib de Python 3.11.
-
-requests==2.31.0
-urllib3==2.2.1
